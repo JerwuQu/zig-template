@@ -28,7 +28,9 @@ const CommandBlock = []const Command;
 
 fn hasField(comptime T: type, comptime name: []const u8) bool {
     const info = @typeInfo(T);
-    return @hasField(if (info == .Optional) info.Optional.child else T, name);
+    const innerT = if (info == .Optional) info.Optional.child else T;
+    const innerInfo = @typeInfo(innerT);
+    return innerInfo == .Struct and @hasField(innerT, name);
 }
 
 // This is a bit of a workaround because zig doesn't have return type inference
@@ -362,17 +364,22 @@ test "bool conditional" {
 
 test "for loop iterator" {
     const Item = struct { name: []const u8 };
-    const template = Template.compile("{for item in .items}[{.item.name}]{/}", .{});
-    testTemplate(template, .{
-        .items = [_]Item{
-            .{ .name = "A" },
-            .{ .name = "B" },
-            .{ .name = "C" },
-        },
+    const template = Template.compile("{for item in .}[{.item.name}]{/}", .{});
+    testTemplate(template, [_]Item{
+        .{ .name = "A" },
+        .{ .name = "B" },
+        .{ .name = "C" },
     }, "[A][B][C]");
 }
 
-test "nested templates" {
+test "nested template" {
+    const template = Template.compile("{.} from outer, {template inner}", .{
+        .templates = .{ .inner = Template.compile("{.} from inner", .{}) },
+    });
+    testTemplate(template, "Hello", "Hello from outer, Hello from inner");
+}
+
+test "complex nested templates" {
     const Person = struct {
         name: []const u8,
         accounts: []const struct {
