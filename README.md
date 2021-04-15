@@ -8,8 +8,8 @@ A work in progress, but any possible errors will arise at compile-time.
 
 ```zig
 const template = comptime Template.compile("Hello, {.}!", .{});
-const output = try template.run(writer, "World");
-// output -> "Hello, World!"
+try template.run(writer, "World");
+// "Hello, World!"
 ```
 
 ## Commands
