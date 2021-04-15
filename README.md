@@ -6,16 +6,20 @@ A work in progress, but any possible errors will arise at compile-time.
 
 ## Usage
 
-`const template = comptime Template.compile("Hello, {.}!", .{});`
-
-`template.run(writer, arg);`
+```zig
+const template = comptime Template.compile("Hello, {.}!", .{});
+const output = try template.run(writer, "World");
+// output -> "Hello, World!"
+```
 
 ## Commands
 
-- `{.path}` - replaced by contents of `path`, can be `.a.nested.path`
-- `{escape .path}` - same as above but html escaped
-- `{template name}` - nest another template called `name`
-- `{scope .path} ... {/}` - scope current context to `path`
-- `{if .path} ... {/}` - only render content if `path` is true (if a bool) or not null (if an option) 
-- `{unless .path} ... {/}` - only render content if `path` is false (if a bool) or null (if an option) 
-- `{for name in .path} ... {/}` - for each item in `path`, output content. `name` will be available in the context
+| Command                       | Description                                                                                                |
+|-------------------------------|------------------------------------------------------------------------------------------------------------|
+| `{.path}`                     | Replaced by contents of `path`. Can be `.a.nested.path`. Passed through the escape function if one exists. |
+| `{bypass .path}`              | Same as above but bypasses the escape function.                                                            |
+| `{template name}`             | Nest another template called `name`.                                                                       |
+| `{scope .path} ... {/}`       | Scope inner content context to `path`.                                                                     |
+| `{if .path} ... {/}`          | Only output inner content if `path` is true (if a bool) or not null (if an option).                        |
+| `{unless .path} ... {/}`      | Only output inner content if `path` is false (if a bool) or null (if an option).                           |
+| `{for name in .path} ... {/}` | For each item in `path`, output inner content. `name` will be available in the context.                    |

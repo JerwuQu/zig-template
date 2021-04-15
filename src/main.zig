@@ -1,13 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
 
-const CommandBlock = []const Command;
 const FieldPath = []const []const u8;
 const Command = union(enum) {
     data: []const u8,
     template: anytype,
     prop: struct {
-        htmlEscape: bool = false,
+        bypass: bool = false,
         fieldPath: FieldPath,
     },
     scope: struct {
@@ -25,6 +24,7 @@ const Command = union(enum) {
         block: CommandBlock,
     },
 };
+const CommandBlock = []const Command;
 
 fn hasField(comptime T: type, comptime name: []const u8) bool {
     const info = @typeInfo(T);
@@ -56,92 +56,23 @@ fn walkField(comptime path: []const []const u8, ctx1: anytype, ctx2: anytype) wa
     return walkField(path[1..], @field(ctxVal, path[0]), .{});
 }
 
-fn htmlEscape(writer: anytype, str: []const u8) !void {
-    var iter: std.unicode.Utf8Iterator = .{ .bytes = str, .i = 0 };
-    while (iter.nextCodepointSlice()) |cps| {
-        _ = try writer.write(
-            if (std.mem.eql(u8, cps, "<")) "&lt;"
-            else if (std.mem.eql(u8, cps, ">")) "&gt;"
-            else if (std.mem.eql(u8, cps, "&")) "&amp;"
-            else cps
-        );
-    }
-}
-
-fn runCommandBlock(comptime block: CommandBlock, writer: anytype, ctx1: anytype, ctx2: anytype) !void {
-    inline for (block) |cmd| {
-        switch (cmd) {
-            .data => |data| _ = try writer.write(data),
-            .template => |tmpl| try tmpl.runContext(writer, ctx1, ctx2),
-            .prop => |prop| {
-                const val = walkField(prop.fieldPath, ctx1, ctx2);
-                const valType = @TypeOf(val);
-                const valTypeInfo = @typeInfo(valType);
-
-                if (valTypeInfo == .Pointer) {
-                    if (prop.htmlEscape) {
-                        try htmlEscape(writer, val);
-                    } else {
-                        _ = try writer.write(val);
-                    }
-                } else if (valTypeInfo == .Int or valTypeInfo == .ComptimeInt) {
-                    try std.fmt.format(writer, "{d}", .{val});
-                } else {
-                    @compileError("unknown type '" ++ @typeName(valType) ++ "'");
-                }
-            },
-            .scope => |scope| {
-                try runCommandBlock(scope.block, writer, walkField(scope.fieldPath, ctx1, ctx2), .{});
-            },
-            .condition => |cond| {
-                const res = walkField(cond.fieldPath, ctx1, ctx2);
-                const resInfo = @typeInfo(@TypeOf(res));
-                if (resInfo == .Bool) {
-                    if (res != cond.invert) {
-                        try runCommandBlock(cond.block, writer, ctx1, ctx2);
-                    }
-                } else if (resInfo == .Optional) {
-                    if ((res == null) == cond.invert) {
-                        try runCommandBlock(cond.block, writer, ctx1, ctx2);
-                    }
-                } else {
-                    @compileError("unknown conditional type '" ++ @TypeOf(res) ++ "'");
-                }
-            },
-            .iterator => |iter| {
-                const values = walkField(iter.fieldPath, ctx1, ctx2);
-                for (values) |value| {
-                    // This is very hacky
-                    // Clones ctx2 struct and adds field named `iter.name` with value `value`
-                    const fields = @typeInfo(@TypeOf(ctx2)).Struct.fields
-                            ++ &[_]std.builtin.TypeInfo.StructField{
-                        .{
-                            .name = iter.name,
-                            .field_type = @TypeOf(value),
-                            .default_value = null,
-                            .is_comptime = false,
-                            .alignment = 0,
-                        }
-                    };
-                    var newCtx2: @Type(std.builtin.TypeInfo {
-                        .Struct = .{
-                            .is_tuple = false,
-                            .layout = .Auto,
-                            .decls = &.{},
-                            .fields = fields,
-                        },
-                    }) = undefined;
-
-                    @field(newCtx2, iter.name) = value;
-                    for (std.meta.fields(@TypeOf(ctx2))) |field| {
-                        @field(newCtx2, field.name) = @field(ctx2, field.name);
-                    }
-
-                    try runCommandBlock(iter.block, writer, ctx1, newCtx2);
-                }
-            },
-        }
-    }
+fn addField(comptime baseType: type, comptime name: []const u8, comptime valueType: type) type {
+    // This is very hacky
+    const newFields = &[1]std.builtin.TypeInfo.StructField{.{
+        .name = name,
+        .field_type = valueType,
+        .default_value = null,
+        .is_comptime = false,
+        .alignment = 0,
+    }};
+    return @Type(std.builtin.TypeInfo{
+        .Struct = .{
+            .is_tuple = false,
+            .layout = .Auto,
+            .decls = &.{},
+            .fields = @typeInfo(baseType).Struct.fields ++ newFields,
+        },
+    });
 }
 
 fn splitSpaces(comptime str: []const u8) []const []const u8 {
@@ -172,7 +103,7 @@ fn splitFieldPath(comptime str: []const u8) FieldPath {
     return out;
 }
 
-fn parseCommand(iter: *std.unicode.Utf8Iterator, templates: anytype, cmdParts: []const []const u8) Command {
+fn parseCommand(iter: *std.unicode.Utf8Iterator, cmdParts: []const []const u8, templates: anytype) Command {
     if (cmdParts.len == 0) {
         @compileError("empty command");
     } else if (cmdParts.len == 1) {
@@ -190,10 +121,10 @@ fn parseCommand(iter: *std.unicode.Utf8Iterator, templates: anytype, cmdParts: [
                 @compileError("expected template, got '" ++ @typeName(@TypeOf(tmpl)) ++ "'");
             }
             return .{ .template = tmpl };
-        } else if (std.mem.eql(u8, cmdParts[0], "escape")) {
+        } else if (std.mem.eql(u8, cmdParts[0], "bypass")) {
             return .{
                 .prop = .{
-                    .htmlEscape = true,
+                    .bypass = true,
                     .fieldPath = splitFieldPath(cmdParts[1]),
                 },
             };
@@ -235,7 +166,7 @@ fn parseCommand(iter: *std.unicode.Utf8Iterator, templates: anytype, cmdParts: [
     @compileError("unknown command '" ++ cmdParts[0] ++ "'");
 }
 
-fn parseBlock(comptime iter: *std.unicode.Utf8Iterator, comptime templates: anytype, isNested: bool) CommandBlock {
+fn parseBlock(iter: *std.unicode.Utf8Iterator, templates: anytype, isNested: bool) CommandBlock {
     var escaped = false;
     var state: enum {
         data,
@@ -268,7 +199,7 @@ fn parseBlock(comptime iter: *std.unicode.Utf8Iterator, comptime templates: anyt
                 return block;
             }
 
-            const cmd = parseCommand(iter, templates, cmdParts);
+            const cmd = parseCommand(iter, cmdParts, templates);
             block = block ++ [1]Command{cmd};
         } else {
             curStr = curStr ++ cps;
@@ -283,17 +214,23 @@ fn parseBlock(comptime iter: *std.unicode.Utf8Iterator, comptime templates: anyt
     return block;
 }
 
+pub const TemplateConfig = struct {
+    /// Function to call for escaping output
+    /// expected prototype: `fn (writer, data: []const u8) !void`
+    /// `anytype` is a workaround for optional function pointers being broken
+    escapeFn: anytype = null,
+    /// KV struct for available templates
+    templates: anytype = null,
+};
+
 pub const Template = struct {
     block: CommandBlock,
+    cfg: TemplateConfig,
 
-    pub fn compile(comptime template: []const u8, comptime templates: anytype) @This() {
+    pub fn compile(comptime template: []const u8, comptime cfg: TemplateConfig) @This() {
         var iter: std.unicode.Utf8Iterator = .{ .bytes = template, .i = 0 };
         @setEvalBranchQuota(100000); // :)
-        return .{ .block = parseBlock(&iter, templates, false) };
-    }
-
-    fn runContext(comptime self: *const @This(), writer: anytype, ctx1: anytype, ctx2: anytype) !void {
-        try runCommandBlock(self.block, writer, ctx1, ctx2);
+        return .{ .cfg = cfg, .block = comptime parseBlock(&iter, cfg.templates, false) };
     }
 
     pub fn run(comptime self: *const @This(), writer: anytype, arg: anytype) !void {
@@ -306,7 +243,81 @@ pub const Template = struct {
         try self.run(str.writer(), arg);
         return str.toOwnedSlice();
     }
+
+    fn runContext(comptime self: *const @This(), writer: anytype, ctx1: anytype, ctx2: anytype) !void {
+        try self.runCommandBlock(self.block, writer, ctx1, ctx2);
+    }
+
+    fn runCommandBlock(comptime self: *const @This(), comptime block: CommandBlock, writer: anytype, ctx1: anytype, ctx2: anytype) !void {
+        inline for (block) |cmd| {
+            switch (cmd) {
+                .data => |data| _ = try writer.write(data),
+                .template => |tmpl| try tmpl.runContext(writer, ctx1, ctx2),
+                .prop => |prop| {
+                    const rawVal = walkField(prop.fieldPath, ctx1, ctx2);
+                    const valType = @TypeOf(rawVal);
+                    const valTypeInfo = @typeInfo(valType);
+
+                    if (valTypeInfo == .Pointer) {
+                        comptime const bypass = prop.bypass or @TypeOf(self.cfg.escapeFn) == @TypeOf(null);
+                        if (bypass) {
+                            _ = try writer.write(rawVal);
+                        } else {
+                            try self.cfg.escapeFn(writer, rawVal);
+                        }
+                    } else if (valTypeInfo == .Int or valTypeInfo == .ComptimeInt) {
+                        try std.fmt.format(writer, "{d}", .{rawVal});
+                    } else {
+                        @compileError("unknown type '" ++ @typeName(valType) ++ "'");
+                    }
+                },
+                .scope => |scope| {
+                    try self.runCommandBlock(scope.block, writer, walkField(scope.fieldPath, ctx1, ctx2), .{});
+                },
+                .condition => |cond| {
+                    const res = walkField(cond.fieldPath, ctx1, ctx2);
+                    const resInfo = @typeInfo(@TypeOf(res));
+                    if (resInfo == .Bool) {
+                        if (res != cond.invert) {
+                            try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
+                        }
+                    } else if (resInfo == .Optional) {
+                        if ((res == null) == cond.invert) {
+                            try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
+                        }
+                    } else {
+                        @compileError("unknown conditional type '" ++ @TypeOf(res) ++ "'");
+                    }
+                },
+                .iterator => |iter| {
+                    const values = walkField(iter.fieldPath, ctx1, ctx2);
+                    for (values) |value| {
+                        // Copy old ctx2 with new field
+                        var newCtx2: addField(@TypeOf(ctx2), iter.name, @TypeOf(value)) = undefined;
+                        for (std.meta.fields(@TypeOf(ctx2))) |field| {
+                            @field(newCtx2, field.name) = @field(ctx2, field.name);
+                        }
+                        @field(newCtx2, iter.name) = value;
+
+                        try self.runCommandBlock(iter.block, writer, ctx1, newCtx2);
+                    }
+                },
+            }
+        }
+    }
 };
+
+pub fn escapeHTML(writer: anytype, data: []const u8) !void {
+    var iter: std.unicode.Utf8Iterator = .{ .bytes = data, .i = 0 };
+    while (iter.nextCodepointSlice()) |cps| {
+        _ = try writer.write(
+            if (std.mem.eql(u8, cps, "<")) "&lt;"
+            else if (std.mem.eql(u8, cps, ">")) "&gt;"
+            else if (std.mem.eql(u8, cps, "&")) "&amp;"
+            else cps
+        );
+    }
+}
 
 fn testTemplate(comptime template: Template, arg: anytype, expected: []const u8) void {
     const result = template.runAlloc(testing.allocator, arg) catch unreachable;
@@ -315,13 +326,18 @@ fn testTemplate(comptime template: Template, arg: anytype, expected: []const u8)
 }
 
 test "basic template" {
-    const template = comptime Template.compile("Hello, {escape .}!", .{});
+    const template = Template.compile("foo {.}", .{});
+    testTemplate(template, "bar", "foo bar");
+}
+
+test "basic html template" {
+    const template = Template.compile("Hello, {.}!", .{ .escapeFn = escapeHTML });
     testTemplate(template, "World", "Hello, World!");
     testTemplate(template, "<Other Name>", "Hello, &lt;Other Name&gt;!");
 }
 
 test "nested structs" {
-    const template = comptime Template.compile("{.name}, {.child.name}, {.child.child.name}", .{});
+    const template = Template.compile("{.name}, {.child.name}, {.child.child.name}", .{});
     testTemplate(template, .{
         .name = "grandpa",
         .child = .{
@@ -334,19 +350,19 @@ test "nested structs" {
 }
 
 test "scopes" {
-    const template = comptime Template.compile("{scope .child}Hello, {.name}!{/}", .{});
+    const template = Template.compile("{scope .child}Hello, {.name}!{/}", .{});
     testTemplate(template, .{ .child = .{ .name = "World" } }, "Hello, World!");
 }
 
 test "bool conditional" {
-    const template = comptime Template.compile("{if .}Yes{/}{unless .}No{/}", .{});
+    const template = Template.compile("{if .}Yes{/}{unless .}No{/}", .{});
     testTemplate(template, true, "Yes");
     testTemplate(template, false, "No");
 }
 
 test "for loop iterator" {
     const Item = struct { name: []const u8 };
-    const template = comptime Template.compile("{for item in .items}[{.item.name}]{/}", .{});
+    const template = Template.compile("{for item in .items}[{.item.name}]{/}", .{});
     testTemplate(template, .{
         .items = [_]Item{
             .{ .name = "A" },
@@ -365,16 +381,16 @@ test "nested templates" {
         },
     };
 
-    const accountTemplate = comptime Template.compile("Account: {escape .name} - Amount: {.amount}", .{});
-    const personTemplate = comptime Template.compile(
-        \\Name: {escape .name}
+    const accountTemplate = Template.compile("Account: {.name} - Amount: {.amount}", .{});
+    const personTemplate = Template.compile(
+        \\Name: {.name}
         \\{for account in .accounts}{scope .account}{template Account}{/}
         \\{/}
-    , .{ .Account = accountTemplate });
-    const template = comptime Template.compile(
+    , .{ .templates = .{ .Account = accountTemplate } });
+    const template = Template.compile(
         \\{for person in .people}{scope .person}{template Person}{/}
         \\{/}
-    , .{ .Person = personTemplate });
+    , .{ .templates = .{ .Person = personTemplate } });
 
     testTemplate(template, .{
         .people = [_]Person{
