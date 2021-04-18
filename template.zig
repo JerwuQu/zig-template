@@ -35,7 +35,8 @@ fn hasField(comptime T: type, comptime name: []const u8) bool {
 
 // This is a bit of a workaround because zig doesn't have return type inference
 // See https://github.com/ziglang/zig/issues/447
-fn walkFieldType(comptime path: []const []const u8, comptime ctx1T: type, comptime ctx2T: type) type {
+// TODO: reduce code duplication
+fn walkFieldType(comptime path: FieldPath, comptime ctx1T: type, comptime ctx2T: type) type {
     if (path.len == 0) {
         return ctx1T;
     }
@@ -46,7 +47,17 @@ fn walkFieldType(comptime path: []const []const u8, comptime ctx1T: type, compti
     return walkFieldType(path[1..], @TypeOf(@field(ctxVal, path[0])), void);
 }
 
-fn walkField(comptime path: []const []const u8, ctx1: anytype, ctx2: anytype) walkFieldType(path, @TypeOf(ctx1), @TypeOf(ctx2)) {
+fn walkFieldExists(comptime path: FieldPath, comptime ctx1T: type, comptime ctx2T: type) bool {
+    if (path.len == 0) {
+        return true;
+    }
+    const T = if (hasField(ctx1T, path[0])) ctx1T else if (hasField(ctx2T, path[0])) ctx2T else return false;
+    const info = @typeInfo(T);
+    const ctxVal: if (info == .Optional) info.Optional.child else T = undefined;
+    return walkFieldExists(path[1..], @TypeOf(@field(ctxVal, path[0])), void);
+}
+
+fn walkField(comptime path: FieldPath, ctx1: anytype, ctx2: anytype) walkFieldType(path, @TypeOf(ctx1), @TypeOf(ctx2)) {
     if (path.len == 0) {
         return ctx1;
     }
@@ -277,18 +288,22 @@ pub const Template = struct {
                     try self.runCommandBlock(scope.block, writer, walkField(scope.fieldPath, ctx1, ctx2), .{});
                 },
                 .condition => |cond| {
-                    const res = walkField(cond.fieldPath, ctx1, ctx2);
-                    const resInfo = @typeInfo(@TypeOf(res));
-                    if (resInfo == .Bool) {
-                        if (res != cond.invert) {
-                            try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
+                    if (comptime walkFieldExists(cond.fieldPath, @TypeOf(ctx1), @TypeOf(ctx2))) {
+                        const res = walkField(cond.fieldPath, ctx1, ctx2);
+                        const resInfo = @typeInfo(@TypeOf(res));
+                        if (resInfo == .Bool) {
+                            if (res != cond.invert) {
+                                try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
+                            }
+                        } else if (resInfo == .Optional) {
+                            if ((res == null) == cond.invert) {
+                                try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
+                            }
+                        } else {
+                            @compileError("unknown conditional type '" ++ @TypeOf(res) ++ "'");
                         }
-                    } else if (resInfo == .Optional) {
-                        if ((res == null) == cond.invert) {
-                            try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
-                        }
-                    } else {
-                        @compileError("unknown conditional type '" ++ @TypeOf(res) ++ "'");
+                    } else if (cond.invert) {
+                        try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
                     }
                 },
                 .iterator => |iter| {
@@ -360,6 +375,12 @@ test "bool conditional" {
     const template = Template.compile("{if .}Yes{/}{unless .}No{/}", .{});
     testTemplate(template, true, "Yes");
     testTemplate(template, false, "No");
+}
+
+test "nonexistent conditional" {
+    const template = Template.compile("{if .maybe}exist{/}{unless .maybe}non-exist{/}", .{});
+    testTemplate(template, .{}, "non-exist");
+    testTemplate(template, .{.maybe = true}, "exist");
 }
 
 test "for loop iterator" {
