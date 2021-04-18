@@ -51,6 +51,7 @@ fn walkFieldExists(comptime path: FieldPath, comptime ctx1T: type, comptime ctx2
     if (path.len == 0) {
         return true;
     }
+
     const T = if (hasField(ctx1T, path[0])) ctx1T else if (hasField(ctx2T, path[0])) ctx2T else return false;
     const info = @typeInfo(T);
     const ctxVal: if (info == .Optional) info.Optional.child else T = undefined;
@@ -268,18 +269,24 @@ pub const Template = struct {
                 .template => |tmpl| try tmpl.runContext(writer, ctx1, ctx2),
                 .prop => |prop| {
                     const rawVal = walkField(prop.fieldPath, ctx1, ctx2);
-                    const valType = @TypeOf(rawVal);
+                    const rawType = @TypeOf(rawVal);
+                    const rawTypeInfo = @typeInfo(rawType);
+                    if (rawTypeInfo == .Optional and rawVal == null) {
+                        continue;
+                    }
+                    const val = if (rawTypeInfo == .Optional) rawVal.? else rawVal;
+                    const valType = @TypeOf(val);
                     const valTypeInfo = @typeInfo(valType);
 
                     if (valTypeInfo == .Pointer) {
                         comptime const bypass = prop.bypass or @TypeOf(self.cfg.escapeFn) == @TypeOf(null);
                         if (bypass) {
-                            _ = try writer.write(rawVal);
+                            _ = try writer.write(val);
                         } else {
-                            try self.cfg.escapeFn(writer, rawVal);
+                            try self.cfg.escapeFn(writer, val);
                         }
                     } else if (valTypeInfo == .Int or valTypeInfo == .ComptimeInt) {
-                        try std.fmt.format(writer, "{d}", .{rawVal});
+                        try std.fmt.format(writer, "{d}", .{val});
                     } else {
                         @compileError("unknown type '" ++ @typeName(valType) ++ "'");
                     }
@@ -288,22 +295,26 @@ pub const Template = struct {
                     try self.runCommandBlock(scope.block, writer, walkField(scope.fieldPath, ctx1, ctx2), .{});
                 },
                 .condition => |cond| {
-                    if (comptime walkFieldExists(cond.fieldPath, @TypeOf(ctx1), @TypeOf(ctx2))) {
-                        const res = walkField(cond.fieldPath, ctx1, ctx2);
-                        const resInfo = @typeInfo(@TypeOf(res));
-                        if (resInfo == .Bool) {
-                            if (res != cond.invert) {
-                                try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
-                            }
-                        } else if (resInfo == .Optional) {
-                            if ((res == null) == cond.invert) {
-                                try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
-                            }
-                        } else {
-                            @compileError("unknown conditional type '" ++ @TypeOf(res) ++ "'");
+                    const exists = comptime walkFieldExists(cond.fieldPath, @TypeOf(ctx1), @TypeOf(ctx2));
+                    if (!exists) {
+                        if (cond.invert) {
+                            try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
                         }
-                    } else if (cond.invert) {
-                        try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
+                        continue;
+                    }
+
+                    const res = walkField(cond.fieldPath, ctx1, ctx2);
+                    const resInfo = @typeInfo(@TypeOf(res));
+                    if (resInfo == .Bool) {
+                        if (res != cond.invert) {
+                            try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
+                        }
+                    } else if (resInfo == .Optional) {
+                        if ((res == null) == cond.invert) {
+                            try self.runCommandBlock(cond.block, writer, ctx1, ctx2);
+                        }
+                    } else {
+                        @compileError("unknown conditional type '" ++ @TypeOf(res) ++ "'");
                     }
                 },
                 .iterator => |iter| {
@@ -351,6 +362,13 @@ test "basic html template" {
     const template = Template.compile("Hello, {.}!", .{ .escapeFn = escapeHTML });
     testTemplate(template, "World", "Hello, World!");
     testTemplate(template, "<Other Name>", "Hello, &lt;Other Name&gt;!");
+}
+
+test "optional value field" {
+    const Input = struct { str: ?[]const u8 };
+    const template = Template.compile("{.str}!", .{});
+    testTemplate(template, .{.str = "foo"}, "foo!");
+    // TODO: this shoud work, too testTemplate(template, .{.str = null}, "!");
 }
 
 test "nested structs" {
